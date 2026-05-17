@@ -24,7 +24,7 @@ class REBOOT:
         self.y_bar = 0.475
         self.phase_2()
         self.phase_3()
-        #self.phase_4()
+        self.phase_4()
 
         print("Attack REBOOT - Finalized")
 
@@ -131,14 +131,38 @@ class REBOOT:
 
             G_j = -(leaf_value * (H_j + reg_lambda)) / eta
 
-            if self.y_bar is not None and 0 < self.y_bar < 1:
+            # ----------------------------------------------------------------
+            # ADAPTAÇÃO LIGHTGBM/DPBOOST
+            # O dump_model() do LightGBM expõe `leaf_count` em cada nó-folha:
+            # número exato de amostras de treino que caíram naquela folha.
+            # Quando disponível, usamos esse valor diretamente em vez de
+            # estimar via H_j / (y_bar*(1-y_bar)) — que degrada em árvores
+            # tardias do boosting porque p_i deixa de ser igual a y_bar.
+            # `N_pos` ainda é inferido a partir de G_j (não exposto direto).
+            # ----------------------------------------------------------------
+            leaf_count = node.get("leaf_count", None)
+
+            if leaf_count is not None:
+                # Caminho preferido: leaf_count exato do LightGBM
+                N_j_total = float(leaf_count)
+                N_j_pos = (N_j_total * self.y_bar) - G_j
+                # Clamp em [0, N_total] pra evitar N_pos negativo ou > N_total
+                N_j_pos = max(0.0, min(N_j_total, N_j_pos))
+                N_j_neg = N_j_total - N_j_pos
+                leaf_count_exposed = True
+            elif self.y_bar is not None and 0 < self.y_bar < 1:
+                # Fallback: estimativa via Hessiano (caso leaf_count ausente,
+                # ex: stump de 1 folha onde o LightGBM não emite o campo)
                 denominador = self.y_bar * (1.0 - self.y_bar)
                 N_j_total = H_j / denominador
                 N_j_pos = (N_j_total * self.y_bar) - G_j
+                N_j_pos = max(0.0, min(N_j_total, N_j_pos))
                 N_j_neg = N_j_total - N_j_pos
+                leaf_count_exposed = False
             else:
                 # Fallback caso a Fase 1 não tenha sido executada ou y_bar seja 0/1
                 N_j_total = N_j_pos = N_j_neg = 0.0
+                leaf_count_exposed = False
 
             leaves_info.append(
                 {
@@ -151,6 +175,7 @@ class REBOOT:
                     "N_total": N_j_total,
                     "N_pos": N_j_pos,
                     "N_neg": N_j_neg,
+                    "leaf_count_exposed": leaf_count_exposed,
                 }
             )
 
@@ -315,7 +340,7 @@ class REBOOT:
             # 2. Calcula os positivos
             n_pos = int(round(leaf["N_pos"]))
 
-            n_pos = max(0, min(n_total, n_pos))  # ✅ clamp em [0, n_total]
+            n_pos = max(0, min(n_total, n_pos))   # ✅ clamp em [0, n_total]
 
             # 3. Trava os negativos matematicamente para evitar vazamento de arredondamento
             n_neg = n_total - n_pos
@@ -346,8 +371,6 @@ class REBOOT:
             f"[Fase 4] {len(self.reconstructed_samples)} amostras instanciadas a partir da Árvore 1."
         )
 
-        return self.reconstructed_samples
-
     def _check_bounds_intersection(self, sample_bounds, leaf_bounds):
         """
         Verifica se é espacialmente possível uma amostra cair em uma folha.
@@ -360,57 +383,6 @@ class REBOOT:
                 if s_max < l_min or s_min > l_max:
                     return False
         return True
-    
-
-    def materialize_samples(self, feature_min_max, seed=42):
-        """
-        Converte cada bound em UM PONTO ESPECÍFICO amostrado uniformemente dentro do
-        hipercubo da amostra. Amostras com bounds idênticos viram pontos diferentes,
-        quebrando a degenerescência que prejudica o emparelhamento da métrica.
-        
-        feature_min_max: dict {feature_idx: (min_global, max_global)} para substituir 
-                        infinitos. O adversário em FL conhece os ranges das features.
-        """
-        rng = np.random.default_rng(seed)
-        n_samples = len(self.reconstructed_samples)
-        X = np.zeros((n_samples, self.num_features))
-        labels = np.zeros(n_samples, dtype=int)
-
-        for i, s in enumerate(self.reconstructed_samples):
-            labels[i] = s["label"]
-            for f in range(self.num_features):
-                # Range global de fallback
-                f_min_global, f_max_global = feature_min_max.get(f, (0.0, 1.0))
-
-                if f in s["bounds"]:
-                    lo, hi = s["bounds"][f]
-                    if lo == float("-inf"): lo = f_min_global
-                    if hi == float("inf"):  hi = f_max_global
-                else:
-                    # Feature não aparece no bound → range global
-                    lo, hi = f_min_global, f_max_global
-
-                # Garante validade do intervalo
-                if hi < lo:
-                    lo, hi = hi, lo
-                if hi == lo:
-                    X[i, f] = lo
-                else:
-                    # Amostragem uniforme dentro do bound (paper TimberStrike)
-                    X[i, f] = rng.uniform(lo, hi)
-
-        return X, labels
-    
-    def get_feature_ranges_from_marginals(self):
-        """Cria ranges de features a partir das marginais recuperadas na Fase 2."""
-        ranges = {}
-        for f, thresholds in self.marginals.items():
-            if thresholds:
-                # Pega min e max dos thresholds com uma pequena folga
-                t_min, t_max = min(thresholds), max(thresholds)
-                margem = (t_max - t_min) * 0.1
-                ranges[f] = (t_min - margem, t_max + margem)
-        return ranges
 
     def _update_sample_bounds(self, sample, leaf_bounds):
         """
@@ -425,6 +397,7 @@ class REBOOT:
                 sample["bounds"][feature][0] = max(s_min, l_min)
                 sample["bounds"][feature][1] = min(s_max, l_max)
 
+
     def _compute_per_sample_stats(self):
         """g_i = p_i - y_i, h_i = p_i*(1-p_i). p_i começa em y_bar para todos."""
         for s in self.reconstructed_samples:
@@ -433,31 +406,7 @@ class REBOOT:
             s["g"] = p_i - s["label"]
             s["h"] = p_i * (1.0 - p_i)
 
-    def _update_sample_stats_after_tree(self, target_leaves, z):
-        """
-        Após resolver MILP de uma árvore, atualiza p_i, g_i, h_i (Eq. 10 do paper).
-        """
-        for i, sample in enumerate(self.reconstructed_samples):
-            for j, leaf in enumerate(target_leaves):
-                if (i, j) in z and z[i, j].X > 0.5:
-                    # leaf_value original da folha: leaf_value = -G_j * eta / (H_j + lambda)
-                    leaf_value = -leaf["G_j"] * self.eta / (leaf["H_j"] + self.reg_lambda)
-                    
-                    # Logit atual = sigmoid^-1(p_atual)
-                    p_atual = sample["p"]
-                    p_atual = min(max(p_atual, 1e-9), 1 - 1e-9)   # evita log(0)
-                    logit_atual = np.log(p_atual / (1 - p_atual))
-                    
-                    # Atualiza logit acumulando o leaf_value (Eq. 10)
-                    logit_novo = logit_atual + leaf_value
-                    p_novo = 1.0 / (1.0 + np.exp(-logit_novo))
-                    
-                    sample["p"] = p_novo
-                    sample["g"] = p_novo - sample["label"]
-                    sample["h"] = p_novo * (1.0 - p_novo)
-                    break
-
-    def phase_4(self):
+    def phase_4(self, next_trees_indices=[1]):
         """
         Fase 4 — Refinamento por MILP (Gurobi).
         Resolve a atribuição de amostras para as folhas das árvores subsequentes.
@@ -473,7 +422,7 @@ class REBOOT:
         trees = self.model_dump.get("tree_info", [])
 
         # Iterar sobre as próximas árvores para refinar as amostras
-        for tree_idx in range(1, len(trees)):
+        for tree_idx in range(1,len(trees)):
             print(f"\n[Fase 4] Formulando MILP para a Árvore {tree_idx}...")
             target_tree = trees[tree_idx]
 
@@ -487,15 +436,10 @@ class REBOOT:
                 self.eta,
                 self.reg_lambda,
             )
-            soma_N = sum(int(round(l["N_total"])) for l in target_leaves)
-            print(
-                f"[DEBUG] Árvore {tree_idx}: Σ N_j_total = {soma_N} (esperado: {len(self.reconstructed_samples)})"
-            )
 
             # 2. Configurar o ambiente Gurobi (silencioso)
             env = gp.Env(empty=True)
             env.setParam("OutputFlag", 0)  # Desliga logs extensos do solver
-            env.setParam('TimeLimit', 240)
             env.start()
             model = gp.Model("GBM_Assignment_Tree_" + str(tree_idx), env=env)
 
@@ -511,15 +455,7 @@ class REBOOT:
                         z[i, j] = model.addVar(vtype=GRB.BINARY, name=f"z_{i}_{j}")
 
             # 4. Restrições do MILP
-            orfas = [
-                i
-                for i in range(len(self.reconstructed_samples))
-                if not any((i, j) in z for j in range(len(target_leaves)))
-            ]
-            if orfas:
-                print(
-                    f"[DEBUG] {len(orfas)} amostras sem folha alcançável na árvore {tree_idx}"
-                )
+
             # Restrição A: Cada amostra DEVE ser atribuída a exatamente UMA folha
             for i in range(len(self.reconstructed_samples)):
                 model.addConstr(
@@ -531,17 +467,17 @@ class REBOOT:
                 )
 
             # Restrição B: A soma das amostras atribuídas deve igualar a capacidade (N_j) da folha
-            # for j, leaf in enumerate(target_leaves):
-            #     N_j_total = int(round(leaf["N_total"]))
-            #     model.addConstr(
-            #         gp.quicksum(
-            #             z[i, j]
-            #             for i in range(len(self.reconstructed_samples))
-            #             if (i, j) in z
-            #         )
-            #         == N_j_total,
-            #         name=f"leaf_capacity_{j}",
-            #     )
+            for j, leaf in enumerate(target_leaves):
+                N_j_total = int(round(leaf["N_total"]))
+                model.addConstr(
+                    gp.quicksum(
+                        z[i, j]
+                        for i in range(len(self.reconstructed_samples))
+                        if (i, j) in z
+                    )
+                    == N_j_total,
+                    name=f"leaf_capacity_{j}",
+                )
 
             # # Restrição C: A soma dos rótulos (amostras positivas) deve igualar N_j_pos da folha
             # for j, leaf in enumerate(target_leaves):
@@ -569,8 +505,7 @@ class REBOOT:
                 # Soma dos g_i das amostras atribuídas à folha j ≈ G_j (gradiente agregado da folha)
                 soma_g = gp.quicksum(
                     self.reconstructed_samples[i]["g"] * z[i, j]
-                    for i in range(len(self.reconstructed_samples))
-                    if (i, j) in z
+                    for i in range(len(self.reconstructed_samples)) if (i, j) in z
                 )
                 model.addConstr(
                     soma_g - leaf["G_j"] == slack_g_pos[j] - slack_g_neg[j],
@@ -580,24 +515,19 @@ class REBOOT:
                 # Soma dos h_i das amostras atribuídas à folha j ≈ H_j (Hessiano agregado da folha)
                 soma_h = gp.quicksum(
                     self.reconstructed_samples[i]["h"] * z[i, j]
-                    for i in range(len(self.reconstructed_samples))
-                    if (i, j) in z
+                    for i in range(len(self.reconstructed_samples)) if (i, j) in z
                 )
                 model.addConstr(
                     soma_h - leaf["H_j"] == slack_h_pos[j] - slack_h_neg[j],
                     name=f"leaf_hess_match_{j}",
-                )
+    )
 
             # 5. Otimização
             # Como é um problema de viabilidade (encontrar UMA atribuição válida que satisfaça tudo),
             # não precisamos de uma função objetivo complexa.
             model.setObjective(
-                gp.quicksum(
-                    slack_g_pos[j] + slack_g_neg[j] for j in range(len(target_leaves))
-                )
-                + gp.quicksum(
-                    slack_h_pos[j] + slack_h_neg[j] for j in range(len(target_leaves))
-                ),
+                gp.quicksum(slack_g_pos[j] + slack_g_neg[j] for j in range(len(target_leaves))) +
+                gp.quicksum(slack_h_pos[j] + slack_h_neg[j] for j in range(len(target_leaves))),
                 GRB.MINIMIZE,
             )
 
@@ -616,7 +546,6 @@ class REBOOT:
                         ].X > 0.5:  # Se a variável for 1 (com tolerância flutuante)
                             self._update_sample_bounds(sample, leaf["bounds"])
                             break  # Já achou a folha, vai pra próxima amostra
-                self._update_sample_stats_after_tree(target_leaves, z)
             else:
                 print(
                     f"[Fase 4] ALERTA: O solver não encontrou solução para a árvore {tree_idx}. O modelo pode estar relaxado ou houve erro numérico nas fases anteriores."
