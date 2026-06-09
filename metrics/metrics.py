@@ -1,16 +1,22 @@
 import numpy as np
 from scipy.optimize import linear_sum_assignment
 import lightgbm as lgb
+from sklearn.metrics import pairwise_distances
+from sklearn.manifold import TSNE
+from sklearn.decomposition import PCA
+import pandas as pd
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot  as plt
 
 
-def criar_mapa_tolerancia(
-    X_real: np.ndarray, indices_categoricos: list, tol_multiplicador: float = 0.319
-) -> list:
-    """
-    Cria um mapa de tolerância baseado no desvio padrão dos dados reais.
-    Para features contínuas, a tolerância é (tol_multiplicador * desvio_padrao).
-    Para features categóricas, exige-se correspondência exata (marcado como 'cat').
-    """
+#Biblioteca que adapta as métricas de attack adaptado do Timberstrike
+# - Reconstruction accuracy
+# - Distância de pares
+#
+
+def criar_mapa_tolerancia(X_real: np.ndarray, indices_categoricos: list, tol_multiplicador: float = 0.319) -> list:
+    
     desvios_padrao = np.std(X_real, axis=0)
     indices_continuos = [
         i for i in range(X_real.shape[1]) if i not in indices_categoricos
@@ -35,18 +41,14 @@ def criar_mapa_tolerancia(
 def _calcular_taxa_erro_amostra(
     amostra_real, amostra_reconstruida, mapa_tolerancia, detalhado=False
 ):
-    """
-    [Função Interna] Calcula a taxa de erro entre uma única linha real e uma reconstruída.
-    Retorna 0 se for perfeito, e 1 se tudo estiver errado.
-    """
+    
     erro_cat = 0
     erro_cont = 0
     num_cats = 0
     num_conts = 0
 
-    for valor_real, valor_rec, tol in zip(
-        amostra_real, amostra_reconstruida, mapa_tolerancia
-    ):
+    for valor_real, valor_rec, tol in zip(amostra_real, amostra_reconstruida, mapa_tolerancia):
+
         if tol == "cat":
             erro_cat += 0 if str(valor_real) == str(valor_rec) else 1
             num_cats += 1
@@ -81,10 +83,7 @@ def calcular_taxa_erro_lote(
     mapa_tolerancia: list,
     detalhado: bool = False,
 ):
-    """
-    Calcula o erro médio entre um lote (batch) de dados reais e reconstruídos,
-    assumindo que as linhas já estão na ordem correta (pareadas).
-    """
+    
     assert X_real.shape == X_rec.shape, (
         "Os dados reais e reconstruídos devem ter o mesmo formato."
     )
@@ -95,9 +94,7 @@ def calcular_taxa_erro_lote(
     num_amostras = X_real.shape[0]
 
     for linha_real, linha_rec in zip(X_real, X_rec):
-        resultado = _calcular_taxa_erro_amostra(
-            linha_real, linha_rec, mapa_tolerancia, detalhado=detalhado
-        )
+        resultado = _calcular_taxa_erro_amostra(linha_real, linha_rec, mapa_tolerancia, detalhado=detalhado)
         if detalhado:
             erro_total_lote += resultado[0] / num_amostras
             erro_cat_lote += resultado[1] / num_amostras
@@ -117,14 +114,8 @@ def emparelhar_reconstrucao_referencia(
     retornar_indices: bool = False,
     base_emparelhamento: str = "all",
 ):
-    """
-    Resolve o problema da falta de ordem nas amostras reconstruídas usando o Algoritmo Húngaro.
-    Ele testa todas as combinações possíveis e emparelha cada linha reconstruída com a sua
-    linha real correspondente minimizando o erro de reconstrução.
-    """
-    assert base_emparelhamento in ["all", "cat", "cont"], (
-        "Escolha válida: 'all', 'cat' ou 'cont'."
-    )
+    
+    assert base_emparelhamento in ["all", "cat", "cont"], ("Escolha válida: 'all', 'cat' ou 'cont'.")
 
     num_amostras = lote_alvo.shape[0]
 
@@ -136,9 +127,7 @@ def emparelhar_reconstrucao_referencia(
     # Preenche as matrizes de custo
     for i, linha_real in enumerate(lote_alvo):
         for j, linha_rec in enumerate(lote_reconstruido):
-            custo_todos, custo_cat, custo_cont = _calcular_taxa_erro_amostra(
-                linha_real, linha_rec, mapa_tolerancia, detalhado=True
-            )
+            custo_todos, custo_cat, custo_cont = _calcular_taxa_erro_amostra(linha_real, linha_rec, mapa_tolerancia, detalhado=True)
             matriz_custo_todos[i, j] = custo_todos
             matriz_custo_cat[i, j] = custo_cat
             matriz_custo_cont[i, j] = custo_cont
@@ -211,17 +200,56 @@ def obter_k_features_menos_importantes_lightgbm(
     return [feature[0] for feature in menos_importantes]
 
 
-# ==============================================================================
-# FUNÇÃO PRINCIPAL UNIFICADA (Acurácia de Reconstrução - RA)
-# ==============================================================================
 
 
-def calcular_ra(
-    X_real: np.ndarray,
-    X_rec: np.ndarray,
-    indices_categoricos: list,
-    tol_multiplicador: float = 0.319,
-) -> float:
+def calcDistanceReconstruct(X_original: pd.DataFrame, X_reconstruido: pd.DataFrame, metric= 'euclidean'):
+
+
+    distances = pairwise_distances(X_reconstruido, X_original, metric=metric)
+
+    return distances
+    
+
+def createScatterPlotReconstruction(X_original, X_reconstruido, name_file="Reconstruct", seed=42, method='pca', name_datastet= '-'):
+    
+    # 1. Validação de método e Nomenclatura Semântica
+    if method == 'pca':
+        reducer = PCA(n_components=2, random_state=seed)
+    elif method == 'tsne':
+        # n_jobs=-1 acelera o t-SNE usando todos os núcleos do processador
+        reducer = TSNE(n_components=2, random_state=seed, n_jobs=1) 
+    else:
+        raise ValueError("O método deve ser 'pca' ou 'tsne'.")
+
+    # 2. Remoção do .copy() para poupar memória (np.concatenate já cria uma nova matriz)
+    X = np.concatenate([X_original, X_reconstruido], axis=0)
+    y = np.concatenate([np.zeros(len(X_original)), np.ones(len(X_reconstruido))])
+
+    # Redução de dimensionalidade
+    x_embedded = reducer.fit_transform(X)
+
+    # 3. Melhorias Visuais no Plot
+    plt.figure(figsize=(10, 8))
+
+    # Uso de cores hexadecimais padrão (mais elegantes), ajuste no tamanho (s) e remoção da borda dos pontos
+    plt.scatter(x_embedded[y == 0, 0], x_embedded[y == 0, 1], label="Original", c="#1f77b4", alpha=0.6, edgecolors='none', s=30)
+    plt.scatter(x_embedded[y == 1, 0], x_embedded[y == 1, 1], label="Reconstructed", c="#d62728", alpha=0.6, edgecolors='none', s=30)
+
+    # Adição de títulos, rótulos e grade
+    plt.title(f"Data Reconstruction Analysis - {method.upper()} in {name_datastet}", fontsize=14)
+    plt.xlabel(f"{method.upper()} Component 1", fontsize=12)
+    plt.ylabel(f"{method.upper()} Component 2", fontsize=12)
+    plt.legend(loc="best", framealpha=0.9)
+    plt.grid(True, linestyle='--', alpha=0.3)
+
+
+    # 5. Salvando com Alta Resolução (300 DPI) e removendo bordas em branco
+    plt.savefig(f"{name_file}.png", dpi=300, bbox_inches='tight')
+    plt.close()
+
+
+
+def calcular_ra(X_real: np.ndarray,X_rec: np.ndarray,indices_categoricos: list,tol_multiplicador: float = 0.319,) -> float:
     """
     Função principal e de alto nível que deve ser chamada para calcular o
     Reconstruction Accuracy (RA) do ataque TimberStrike.
@@ -267,4 +295,4 @@ def calcular_ra(
     erro_medio = np.mean(array_erros)
     ra_score = (1.0 - erro_medio)
 
-    return ra_score
+    return ra_score, lote_rec_reordenado

@@ -4,12 +4,11 @@ import gurobipy as gp
 from gurobipy import GRB
 import lightgbm as lgb
 
-
 class REBOOT:
     def __init__(
-        self, model: lgb.Booster, N, num_features, num_categoricas, num_continuas
+        self, model: lgb.Booster, N, num_features, num_categoricas, num_continuas,feature_ranges
     ):
-
+        self.model = model
         self.model_dump = model.dump_model()
         self.N_total = N
         self.num_features = num_features
@@ -17,26 +16,24 @@ class REBOOT:
         self.num_continuas = num_continuas
         self.eta = self.model_dump.get("learning_rate", 0.05)
         self.reg_lambda = self.model_dump.get("lambda_l2", 0.1)
+        self.feature_ranges=feature_ranges
 
     def execute(self):
         print("Attack REBOOT - Starting")
         self.phase_1()
-        self.y_bar = 0.475
         self.phase_2()
         self.phase_3()
-        #self.phase_4()
+        self.phase_4()
 
         print("Attack REBOOT - Finalized")
 
     def phase_1(self):
 
-        f0, objective = self._extract_f0_and_objective()
-        print(f"F_0 extraída: {f0}, Objetivo: {objective}")
+        f0, objective, reconstruct_mean = self._extract_f0_and_objective()
+        print(f"F_0 extraída: {f0}, Objetivo: {objective}, media recuperada: {reconstruct_mean}")
 
         if "binary" in objective:
-            # self.y_bar = 1/(1+np.exp(-f0))
-            self.y_bar = 0.475
-
+            self.y_bar = reconstruct_mean
             print(f"Probabilidade média (y_bar) calculada: {self.y_bar:.6f}")
 
         elif "regression" in objective:
@@ -46,24 +43,21 @@ class REBOOT:
         return self.y_bar, objective
 
     def _extract_f0_and_objective(self):
-        # Extrai f0 e o objetivo do modelo
-        # 1. Identificar a função objetivo do modelo
         objective = self.model_dump.get("objective", "regression")
 
-        # 2. Extrair o score inicial (F_0)
-        # Nota: No LightGBM moderno, o F_0 originado de 'boost_from_average=True'
-        # pode vir codificado como uma árvore de um único nó (a árvore 0) ou salvo
-        # nos metadados. Para fins de generalização, abstraímos essa extração pura.
+        init_score_extraido = 0.0  
+                
+        sample = np.zeros((1,self.num_features))
 
-        f0 = 0.0  # Valor padrão. A lógica abaixo procura F_0 em cenários comuns.
+        print(f"Número de árvores no modelo: {self.model.num_trees()}")
 
-        # Exemplo de lógica de parsing (depende da versão do LightGBM):
-        # Se a primeira árvore tem apenas uma folha, ela costuma guardar o bias global.
-        first_tree = self.model_dump.get("tree_info", [])[0]
-        if first_tree["num_leaves"] == 1:
-            f0 = first_tree["tree_structure"]["leaf_value"]
+        contribuicoes =self.model.predict(sample, pred_contrib=True, num_iteration=1)
 
-        return f0, objective
+        init_score_extraido = contribuicoes[0, -1]
+
+        reconstruct_mean = 1/(1+np.exp(-init_score_extraido))
+
+        return init_score_extraido, objective, reconstruct_mean 
 
     def _traverse_node(self, node, feature_thresholds):
 
@@ -86,11 +80,6 @@ class REBOOT:
             self._traverse_node(node["right_child"], feature_thresholds)
 
     def phase_2(self):
-        """
-        Fase 2 — Recuperação das marginais.
-        Extrai os limiares (bins) do LightGBM percorrendo todas as árvores
-        para reconstruir a CDF inversa de cada feature.
-        """
 
         # Reconstrucão dos limites das features (mínimos e máximos) a partir do modelo.
         print("[Fase 2] Iniciando extração dos limiares de feature...")
@@ -131,18 +120,43 @@ class REBOOT:
 
             G_j = -(leaf_value * (H_j + reg_lambda)) / eta
 
-            if self.y_bar is not None and 0 < self.y_bar < 1:
+            # ----------------------------------------------------------------
+            # ADAPTAÇÃO LIGHTGBM/DPBOOST
+            # O dump_model() do LightGBM expõe `leaf_count` em cada nó-folha:
+            # número exato de amostras de treino que caíram naquela folha.
+            # Quando disponível, usamos esse valor diretamente em vez de
+            # estimar via H_j / (y_bar*(1-y_bar)) — que degrada em árvores
+            # tardias do boosting porque p_i deixa de ser igual a y_bar.
+            # `N_pos` ainda é inferido a partir de G_j (não exposto direto).
+            # ----------------------------------------------------------------
+            leaf_count = node.get("leaf_count", None)
+
+            if leaf_count is not None:
+                # Caminho preferido: leaf_count exato do LightGBM
+                N_j_total = float(leaf_count)
+                N_j_pos = (N_j_total * self.y_bar) - G_j
+                # Clamp em [0, N_total] pra evitar N_pos negativo ou > N_total
+                N_j_pos = max(0.0, min(N_j_total, N_j_pos))
+                N_j_neg = N_j_total - N_j_pos
+                leaf_count_exposed = True
+            elif self.y_bar is not None and 0 < self.y_bar < 1:
+                # Fallback: estimativa via Hessiano (caso leaf_count ausente,
+                # ex: stump de 1 folha onde o LightGBM não emite o campo)
                 denominador = self.y_bar * (1.0 - self.y_bar)
                 N_j_total = H_j / denominador
                 N_j_pos = (N_j_total * self.y_bar) - G_j
+                N_j_pos = max(0.0, min(N_j_total, N_j_pos))
                 N_j_neg = N_j_total - N_j_pos
+                leaf_count_exposed = False
             else:
                 # Fallback caso a Fase 1 não tenha sido executada ou y_bar seja 0/1
                 N_j_total = N_j_pos = N_j_neg = 0.0
+                leaf_count_exposed = False
 
             leaves_info.append(
                 {
                     "leaf_index": leaf_index,
+                    "leaf_value":leaf_value,
                     "bounds": copy.deepcopy(
                         current_bounds
                     ),  # Restrições espaciais (hipercubo)
@@ -151,6 +165,7 @@ class REBOOT:
                     "N_total": N_j_total,
                     "N_pos": N_j_pos,
                     "N_neg": N_j_neg,
+                    "leaf_count_exposed": leaf_count_exposed,
                 }
             )
 
@@ -203,12 +218,14 @@ class REBOOT:
             parte_decimal = valor_cru - int(valor_cru)
             erros_fracionarios.append((i, parte_decimal))
 
+        num_leaves = len(erros_fracionarios)
+
         # Ordena pelas folhas mais "incertas"
         if diferenca > 0:
             # Precisamos adicionar amostras: pegar os maiores decimais (ex: .49)
             erros_fracionarios.sort(key=lambda x: x[1], reverse=True)
             for k in range(diferenca):
-                idx = erros_fracionarios[k][0]
+                idx = erros_fracionarios[k%num_leaves][0]
                 self.leaves_reconstruction[idx]["N_total"] += 1
                 # Aproxima também no rótulo majoritário da folha
                 self.leaves_reconstruction[idx]["N_pos"] += self.y_bar
@@ -219,7 +236,7 @@ class REBOOT:
                 idx = erros_fracionarios[k][0]
                 self.leaves_reconstruction[idx]["N_total"] -= 1
 
-    def phase_3(self, eta=1.0, reg_lambda=1.0):
+    def phase_3(self):
         """
         Fase 3 — Inversão por folha.
         Reconstrói a contagem de amostras, rótulos e restrições espaciais
@@ -235,6 +252,7 @@ class REBOOT:
             self.y_bar = 0.5
 
         trees = self.model_dump.get("tree_info", [])
+
 
         first_split_tree = None
 
@@ -262,8 +280,8 @@ class REBOOT:
             first_split_tree["tree_structure"],
             initial_bounds,
             self.leaves_reconstruction,
-            eta=eta,
-            reg_lambda=reg_lambda,
+            eta=self.eta,
+            reg_lambda=self.reg_lambda,
         )
 
         print(
@@ -308,6 +326,8 @@ class REBOOT:
         self.reconstructed_samples = []
         sample_id = 0
 
+        raw_init = np.log(self.y_bar / (1.0 - self.y_bar))
+
         for leaf in self.leaves_reconstruction:
             # 1. Trava o total da folha (que já foi reconciliado e é exato)
             n_total = int(round(leaf["N_total"]))
@@ -315,7 +335,7 @@ class REBOOT:
             # 2. Calcula os positivos
             n_pos = int(round(leaf["N_pos"]))
 
-            n_pos = max(0, min(n_total, n_pos))  # ✅ clamp em [0, n_total]
+            n_pos = max(0, min(n_total, n_pos))   # ✅ clamp em [0, n_total]
 
             # 3. Trava os negativos matematicamente para evitar vazamento de arredondamento
             n_neg = n_total - n_pos
@@ -327,6 +347,7 @@ class REBOOT:
                         "id": sample_id,
                         "label": 1,
                         "bounds": copy.deepcopy(leaf["bounds"]),
+                        "raw": raw_init,
                     }
                 )
                 sample_id += 1
@@ -346,8 +367,6 @@ class REBOOT:
             f"[Fase 4] {len(self.reconstructed_samples)} amostras instanciadas a partir da Árvore 1."
         )
 
-        return self.reconstructed_samples
-
     def _check_bounds_intersection(self, sample_bounds, leaf_bounds):
         """
         Verifica se é espacialmente possível uma amostra cair em uma folha.
@@ -360,57 +379,6 @@ class REBOOT:
                 if s_max < l_min or s_min > l_max:
                     return False
         return True
-    
-
-    def materialize_samples(self, feature_min_max, seed=42):
-        """
-        Converte cada bound em UM PONTO ESPECÍFICO amostrado uniformemente dentro do
-        hipercubo da amostra. Amostras com bounds idênticos viram pontos diferentes,
-        quebrando a degenerescência que prejudica o emparelhamento da métrica.
-        
-        feature_min_max: dict {feature_idx: (min_global, max_global)} para substituir 
-                        infinitos. O adversário em FL conhece os ranges das features.
-        """
-        rng = np.random.default_rng(seed)
-        n_samples = len(self.reconstructed_samples)
-        X = np.zeros((n_samples, self.num_features))
-        labels = np.zeros(n_samples, dtype=int)
-
-        for i, s in enumerate(self.reconstructed_samples):
-            labels[i] = s["label"]
-            for f in range(self.num_features):
-                # Range global de fallback
-                f_min_global, f_max_global = feature_min_max.get(f, (0.0, 1.0))
-
-                if f in s["bounds"]:
-                    lo, hi = s["bounds"][f]
-                    if lo == float("-inf"): lo = f_min_global
-                    if hi == float("inf"):  hi = f_max_global
-                else:
-                    # Feature não aparece no bound → range global
-                    lo, hi = f_min_global, f_max_global
-
-                # Garante validade do intervalo
-                if hi < lo:
-                    lo, hi = hi, lo
-                if hi == lo:
-                    X[i, f] = lo
-                else:
-                    # Amostragem uniforme dentro do bound (paper TimberStrike)
-                    X[i, f] = rng.uniform(lo, hi)
-
-        return X, labels
-    
-    def get_feature_ranges_from_marginals(self):
-        """Cria ranges de features a partir das marginais recuperadas na Fase 2."""
-        ranges = {}
-        for f, thresholds in self.marginals.items():
-            if thresholds:
-                # Pega min e max dos thresholds com uma pequena folga
-                t_min, t_max = min(thresholds), max(thresholds)
-                margem = (t_max - t_min) * 0.1
-                ranges[f] = (t_min - margem, t_max + margem)
-        return ranges
 
     def _update_sample_bounds(self, sample, leaf_bounds):
         """
@@ -425,37 +393,21 @@ class REBOOT:
                 sample["bounds"][feature][0] = max(s_min, l_min)
                 sample["bounds"][feature][1] = min(s_max, l_max)
 
-    def _compute_per_sample_stats(self):
-        """g_i = p_i - y_i, h_i = p_i*(1-p_i). p_i começa em y_bar para todos."""
-        for s in self.reconstructed_samples:
-            p_i = s.get("p", self.y_bar)
-            s["p"] = p_i
-            s["g"] = p_i - s["label"]
-            s["h"] = p_i * (1.0 - p_i)
 
-    def _update_sample_stats_after_tree(self, target_leaves, z):
+    def _compute_per_sample_stats(self):
         """
-        Após resolver MILP de uma árvore, atualiza p_i, g_i, h_i (Eq. 10 do paper).
+        Inicializa raw score, p, g, h para cada amostra a partir de y_bar.
+        raw_init = logit(y_bar), p_init = y_bar (estado pré-árvore-1).
         """
-        for i, sample in enumerate(self.reconstructed_samples):
-            for j, leaf in enumerate(target_leaves):
-                if (i, j) in z and z[i, j].X > 0.5:
-                    # leaf_value original da folha: leaf_value = -G_j * eta / (H_j + lambda)
-                    leaf_value = -leaf["G_j"] * self.eta / (leaf["H_j"] + self.reg_lambda)
-                    
-                    # Logit atual = sigmoid^-1(p_atual)
-                    p_atual = sample["p"]
-                    p_atual = min(max(p_atual, 1e-9), 1 - 1e-9)   # evita log(0)
-                    logit_atual = np.log(p_atual / (1 - p_atual))
-                    
-                    # Atualiza logit acumulando o leaf_value (Eq. 10)
-                    logit_novo = logit_atual + leaf_value
-                    p_novo = 1.0 / (1.0 + np.exp(-logit_novo))
-                    
-                    sample["p"] = p_novo
-                    sample["g"] = p_novo - sample["label"]
-                    sample["h"] = p_novo * (1.0 - p_novo)
-                    break
+        eps = 1e-12
+        y_bar_clamped = min(max(self.y_bar, eps), 1.0 - eps)
+        raw_init = np.log(y_bar_clamped / (1.0 - y_bar_clamped))
+        
+        for s in self.reconstructed_samples:
+            s["raw"] = raw_init
+            s["p"]   = y_bar_clamped
+            s["g"]   = s["p"] - s["label"]
+            s["h"]   = s["p"] * (1.0 - s["p"])
 
     def phase_4(self):
         """
@@ -473,7 +425,7 @@ class REBOOT:
         trees = self.model_dump.get("tree_info", [])
 
         # Iterar sobre as próximas árvores para refinar as amostras
-        for tree_idx in range(1, len(trees)):
+        for tree_idx in range(1,len(trees)):
             print(f"\n[Fase 4] Formulando MILP para a Árvore {tree_idx}...")
             target_tree = trees[tree_idx]
 
@@ -487,15 +439,10 @@ class REBOOT:
                 self.eta,
                 self.reg_lambda,
             )
-            soma_N = sum(int(round(l["N_total"])) for l in target_leaves)
-            print(
-                f"[DEBUG] Árvore {tree_idx}: Σ N_j_total = {soma_N} (esperado: {len(self.reconstructed_samples)})"
-            )
 
             # 2. Configurar o ambiente Gurobi (silencioso)
             env = gp.Env(empty=True)
             env.setParam("OutputFlag", 0)  # Desliga logs extensos do solver
-            env.setParam('TimeLimit', 240)
             env.start()
             model = gp.Model("GBM_Assignment_Tree_" + str(tree_idx), env=env)
 
@@ -511,15 +458,7 @@ class REBOOT:
                         z[i, j] = model.addVar(vtype=GRB.BINARY, name=f"z_{i}_{j}")
 
             # 4. Restrições do MILP
-            orfas = [
-                i
-                for i in range(len(self.reconstructed_samples))
-                if not any((i, j) in z for j in range(len(target_leaves)))
-            ]
-            if orfas:
-                print(
-                    f"[DEBUG] {len(orfas)} amostras sem folha alcançável na árvore {tree_idx}"
-                )
+
             # Restrição A: Cada amostra DEVE ser atribuída a exatamente UMA folha
             for i in range(len(self.reconstructed_samples)):
                 model.addConstr(
@@ -531,17 +470,17 @@ class REBOOT:
                 )
 
             # Restrição B: A soma das amostras atribuídas deve igualar a capacidade (N_j) da folha
-            # for j, leaf in enumerate(target_leaves):
-            #     N_j_total = int(round(leaf["N_total"]))
-            #     model.addConstr(
-            #         gp.quicksum(
-            #             z[i, j]
-            #             for i in range(len(self.reconstructed_samples))
-            #             if (i, j) in z
-            #         )
-            #         == N_j_total,
-            #         name=f"leaf_capacity_{j}",
-            #     )
+            for j, leaf in enumerate(target_leaves):
+                N_j_total = int(round(leaf["N_total"]))
+                model.addConstr(
+                    gp.quicksum(
+                        z[i, j]
+                        for i in range(len(self.reconstructed_samples))
+                        if (i, j) in z
+                    )
+                    == N_j_total,
+                    name=f"leaf_capacity_{j}",
+                )
 
             # # Restrição C: A soma dos rótulos (amostras positivas) deve igualar N_j_pos da folha
             # for j, leaf in enumerate(target_leaves):
@@ -569,8 +508,7 @@ class REBOOT:
                 # Soma dos g_i das amostras atribuídas à folha j ≈ G_j (gradiente agregado da folha)
                 soma_g = gp.quicksum(
                     self.reconstructed_samples[i]["g"] * z[i, j]
-                    for i in range(len(self.reconstructed_samples))
-                    if (i, j) in z
+                    for i in range(len(self.reconstructed_samples)) if (i, j) in z
                 )
                 model.addConstr(
                     soma_g - leaf["G_j"] == slack_g_pos[j] - slack_g_neg[j],
@@ -580,24 +518,19 @@ class REBOOT:
                 # Soma dos h_i das amostras atribuídas à folha j ≈ H_j (Hessiano agregado da folha)
                 soma_h = gp.quicksum(
                     self.reconstructed_samples[i]["h"] * z[i, j]
-                    for i in range(len(self.reconstructed_samples))
-                    if (i, j) in z
+                    for i in range(len(self.reconstructed_samples)) if (i, j) in z
                 )
                 model.addConstr(
                     soma_h - leaf["H_j"] == slack_h_pos[j] - slack_h_neg[j],
                     name=f"leaf_hess_match_{j}",
-                )
+    )
 
             # 5. Otimização
             # Como é um problema de viabilidade (encontrar UMA atribuição válida que satisfaça tudo),
             # não precisamos de uma função objetivo complexa.
             model.setObjective(
-                gp.quicksum(
-                    slack_g_pos[j] + slack_g_neg[j] for j in range(len(target_leaves))
-                )
-                + gp.quicksum(
-                    slack_h_pos[j] + slack_h_neg[j] for j in range(len(target_leaves))
-                ),
+                gp.quicksum(slack_g_pos[j] + slack_g_neg[j] for j in range(len(target_leaves))) +
+                gp.quicksum(slack_h_pos[j] + slack_h_neg[j] for j in range(len(target_leaves))),
                 GRB.MINIMIZE,
             )
 
@@ -611,16 +544,82 @@ class REBOOT:
                 # 6. Atualizar os limites (apertar o cerco) com base na atribuição
                 for i, sample in enumerate(self.reconstructed_samples):
                     for j, leaf in enumerate(target_leaves):
-                        if (i, j) in z and z[
-                            i, j
-                        ].X > 0.5:  # Se a variável for 1 (com tolerância flutuante)
+                        if (i, j) in z and z[i, j].X > 0.5:  # Se a variável for 1 (com tolerância flutuante)
                             self._update_sample_bounds(sample, leaf["bounds"])
+
+                            sample["raw"] = sample["raw"] + leaf["leaf_value"]
+                
+                            # 3. Recalcula p, g, h com clamping numérico
+                            eps = 1e-12
+                            sample["p"] = 1.0 / (1.0 + np.exp(-sample["raw"]))
+                            sample["p"] = min(max(sample["p"], eps), 1.0 - eps)
+                            sample["g"] = sample["p"] - sample["label"]
+                            sample["h"] = sample["p"] * (1.0 - sample["p"])
+
                             break  # Já achou a folha, vai pra próxima amostra
-                self._update_sample_stats_after_tree(target_leaves, z)
             else:
                 print(
                     f"[Fase 4] ALERTA: O solver não encontrou solução para a árvore {tree_idx}. O modelo pode estar relaxado ou houve erro numérico nas fases anteriores."
                 )
 
         print("\n[Fase 4] Refinamento concluído.")
-        return self.reconstructed_samples
+
+        samples = self.reconstruct_dataset_to_samples()
+
+        return samples
+    
+
+
+    def reconstruct_dataset_to_samples(self):
+
+
+        samples = self.reconstructed_samples
+
+        num_features = self.num_features
+        matriz_reconstruida = []
+
+        minimos_reais = [min_ for _,[min_,_] in self.feature_ranges.items()]
+        maximos_reais = [max_ for _,[_,max_] in self.feature_ranges.items()]
+    
+        for amostra in samples:
+            # Cria uma linha vazia com espaço para as features + 1 espaço para o label no final
+            linha = np.zeros(num_features + 1)
+            bounds = amostra.get('bounds', {})
+            
+            for f_idx in range(num_features):
+                # Se o atacante descobriu os limites da feature
+                if f_idx in bounds:
+                    limite_inferior, limite_superior = bounds[f_idx]
+                    
+                    if limite_inferior == -float('inf'):
+                        limite_inferior = minimos_reais[f_idx]
+                    if limite_superior == float('inf'):
+                        limite_superior = maximos_reais[f_idx]
+                        
+                    # O palpite é o ponto médio do intervalo descoberto
+                    linha[f_idx] = (limite_inferior + limite_superior) / 2.0
+                    
+                # Se o atacante NÃO descobriu a feature, faz amostragem aleatória
+                else:
+                    min_val = minimos_reais[f_idx]
+                    max_val = maximos_reais[f_idx]
+                    
+                    # 1. Define a média no centro do intervalo
+                    mean = (min_val + max_val) / 2.0
+                    
+                    # 2. Define o desvio padrão (Regra Empírica: 6 sigmas cobrem 99.7% da curva)
+                    # Previne divisão por zero caso min_val == max_val
+                    std = max((max_val - min_val) / 6.0, 1e-9) 
+                    
+                    # Sorteia um valor da distribuição normal
+                    valor_sorteado = np.random.normal(loc=mean, scale=std)
+                    
+                    # 3. Garante que o valor não fuja do limite [min, max]
+                    linha[f_idx] = np.clip(valor_sorteado, min_val, max_val)
+                    
+            # Adiciona o Label (Y) na última coluna
+            linha[-1] = amostra.get('label', 0)
+            
+            matriz_reconstruida.append(linha)
+            
+        return np.array(matriz_reconstruida)

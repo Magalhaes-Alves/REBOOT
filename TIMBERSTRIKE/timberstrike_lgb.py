@@ -1,67 +1,3 @@
-"""
-TimberStrike for LightGBM
-=========================
-
-High-fidelity adaptation of the TimberStrike dataset-reconstruction attack
-(Di Gennaro et al., "TimberStrike: Dataset Reconstruction Attack Revealing
-Privacy Leakage in Federated Tree-Based Systems", PETS 2025) to LightGBM
-gradient-boosted binary classifiers.
-
-The attack assumes white-box access to the victim's (or the federation's
-global) trained LightGBM ``Booster`` -- which mirrors what an
-honest-but-curious client sees in horizontal federated tree-based systems.
-
-Two phases (following Sections 5.1 and 5.2 of the paper):
-
-1. **First-Tree Probing** -- from the first tree the adversary infers:
-   * the number of samples per leaf  (Eq. 6)
-   * the label distribution per leaf  (Eqs. 7-9)
-   * an initial bounding box for every reconstructed sample using the
-     decision path that leads to its leaf
-   * per-sample probability, gradient and Hessian statistics (Eqs. 3, 10).
-
-2. **Feature-Range Inference** -- for every subsequent tree, the adversary
-   sets up a discrete optimisation problem (Eqs. 11-13) that assigns each
-   reconstructed sample to a leaf of the tree, respecting the reachability
-   sets implied by the current feature ranges, and minimising the
-   discrepancy between reconstructed and observed aggregated gradients and
-   Hessians.  After solving, sample feature boxes and per-sample statistics
-   are updated.
-
-LightGBM-specific adaptations (compared with the XGBoost formulation in the
-paper):
-
-* LightGBM uses an additive logit ``init_score`` rather than a probability
-  ``base_score``.  We work with the probability form
-  ``b = sigmoid(init_score)``; the two are equivalent.
-* The first-tree Hessian per sample equals ``b*(1-b)``; we verify and
-  optionally *recover* ``b`` from the very stable ratio ``H_j / N_j`` of
-  the first tree, since LightGBM exposes both quantities directly in the
-  model dump (fields ``leaf_weight`` and ``leaf_count``).  This makes the
-  attack effectively zero-knowledge on the base score.
-* LightGBM stores the post-shrinkage leaf weights (Eq. 7 becomes
-  ``leaf_value = -lr * G_j / (H_j + lambda_l2)``).  The model raw score
-  is the *sum of leaf values across trees* with **no separate init term**:
-  when ``boost_from_average=True`` (the default for binary classification)
-  LightGBM bakes the initial logit ``logit(b)`` directly into the leaf
-  values of tree 0, so for tree 0 in that mode
-  ``leaf_value_0 = logit(b) + lr * (-G_0 / (H_0 + lambda_l2))`` --
-  this is verified empirically in the test suite.  We detect the
-  ``boost_from_average`` mode from the per-tree ``shrinkage`` field of
-  the model dump (``shrinkage=1`` for tree 0 indicates that the init
-  has been absorbed).
-* The paper's quadratic objective (Eq. 13) is solved here as a real MILP
-  by L1-linearising the per-leaf gradient and Hessian residuals -- the
-  paper refers to the optimisation as a "MILP" throughout.  The CBC solver
-  bundled with PuLP suffices; commercial MIQP solvers can be plugged in
-  trivially to recover the exact L2 objective.
-
-The implementation focuses on **binary classification with numerical
-features**, which is the main setting evaluated in the TimberStrike paper.
-A note at the end of the file sketches the categorical and multi-class
-extensions.
-"""
-
 from __future__ import annotations
 
 import math
@@ -83,18 +19,18 @@ class TreeNode:
     # internal-node fields
     split_feature: Optional[int] = None
     threshold: Optional[float] = None
-    decision_type: Optional[str] = None       # '<=' (numerical) or '==' (categorical)
+    decision_type: Optional[str] = None       
     default_left: bool = True
     left: Optional["TreeNode"] = None
     right: Optional["TreeNode"] = None
     internal_count: Optional[int] = None
-    internal_weight: Optional[float] = None   # aggregated Hessian of internal node
+    internal_weight: Optional[float] = None   
     internal_value: Optional[float] = None
-    # leaf fields
+
     leaf_index: Optional[int] = None
-    leaf_value: Optional[float] = None        # already shrunk by learning rate
-    leaf_count: Optional[int] = None          # N_j in the paper
-    leaf_weight: Optional[float] = None       # H_j in the paper
+    leaf_value: Optional[float] = None        
+    leaf_count: Optional[int] = None          
+    leaf_weight: Optional[float] = None       
 
 
 @dataclass
@@ -250,7 +186,7 @@ class TimberStrikeLightGBM:
         self.n_features = n_features
         if len(feature_bounds) != n_features:
             raise ValueError("feature_bounds must have length n_features")
-        self.feature_bounds = [(float(lo), float(hi)) for lo, hi in feature_bounds]
+        self.feature_bounds = [(float(lo), float(hi)) for k, [lo, hi] in feature_bounds.items()]
         self.learning_rate = float(learning_rate)
         self.reg_lambda = float(reg_lambda)
         self.milp_time_limit = int(milp_time_limit)
